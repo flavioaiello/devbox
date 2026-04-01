@@ -1,4 +1,7 @@
-# devbox
+<h1>
+  <img src="logo.svg" alt="devbox logo" width="120" align="right" />
+  devbox
+</h1>
 
 A clean, reproducible macOS dev environment in one command. Powered by [Tart](https://tart.run).
 

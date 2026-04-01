@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="box-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6C5CE7"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="lid-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8B7CF6"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="screen-grad" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#312e81"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#6C5CE7" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Box body (3D isometric-ish) -->
+  <!-- Front face -->
+  <path d="M96 240 L256 340 L416 240 L416 380 L256 480 L96 380 Z" fill="url(#box-grad)" filter="url(#shadow)"/>
+  <!-- Left face darker -->
+  <path d="M96 240 L256 340 L256 480 L96 380 Z" fill="#5B4BD6" opacity="0.9"/>
+  <!-- Right face lighter -->
+  <path d="M256 340 L416 240 L416 380 L256 480 Z" fill="#7C6CF0" opacity="0.9"/>
+
+  <!-- Box lid / top flaps (open) -->
+  <!-- Left flap -->
+  <path d="M96 240 L256 140 L256 340 Z" fill="url(#lid-grad)" opacity="0.85"/>
+  <!-- Right flap -->
+  <path d="M256 140 L416 240 L256 340 Z" fill="#9B8BF4" opacity="0.85"/>
+
+  <!-- Apple-ish mark on the box front -->
+  <path d="M248 400 C248 388 264 388 264 400 C264 412 248 412 248 400 Z" fill="#e0e7ff" opacity="0.3"/>
+
+  <!-- Sparkle / dot accent top-right -->
+  <circle cx="380" cy="160" r="6" fill="#fbbf24" opacity="0.9"/>
+  <circle cx="400" cy="140" r="3" fill="#fbbf24" opacity="0.5"/>
+  <circle cx="365" cy="145" r="4" fill="#c084fc" opacity="0.6"/>
+</svg>
