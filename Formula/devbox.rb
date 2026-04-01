@@ -2,7 +2,7 @@ class Devbox < Formula
   desc "Immutable local macOS dev box workflow using Tart VMs"
   homepage "https://github.com/flavioaiello/devbox"
   url "https://github.com/flavioaiello/devbox/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "7ebdbe4c308fa5ae93736dec45c245b3dc3ee167caa0975e8e0452a8e33bf2e5"
+  sha256 "f2b25afda9ad9295d49115084e94080fc98c7b7a476b182bd7f270781657028f"
   license "MIT"
 
   depends_on :macos

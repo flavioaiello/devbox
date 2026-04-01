@@ -127,9 +127,16 @@ apply_trackpad() {
   fi
 
   log "Setting trackpad tap-to-click: $clicking"
-  run_as_target defaults write com.apple.AppleMultitouchTrackpad Clicking -bool "$clicking"
-  run_as_target defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad Clicking -bool "$clicking"
-  run_as_target defaults -currentHost write -g com.apple.mouse.tapBehavior -int "$clicking"
+
+  local bool_value
+  if [[ "$clicking" == "1" ]]; then
+    bool_value="true"
+  else
+    bool_value="false"
+  fi
+
+  run_as_target defaults write com.apple.AppleMultitouchTrackpad Clicking -bool "$bool_value"
+  run_as_target defaults write com.apple.driver.AppleBluetoothMultitouch.trackpad Clicking -bool "$bool_value"
 }
 
 apply_gitconfig() {
