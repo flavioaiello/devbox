@@ -51,6 +51,19 @@ write_keyboard_defaults() {
 
   # Also write to the global domain so the login session picks it up.
   run_as_target defaults write -g AppleCurrentKeyboardLayoutInputSourceID -string "$DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID"
+
+  # Write to the system-level plist so the loginwindow session uses this layout.
+  local sys_domain
+  sys_domain="/Library/Preferences/com.apple.HIToolbox.plist"
+  sudo defaults write "$sys_domain" AppleCurrentKeyboardLayoutInputSourceID -string "$DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID"
+  sudo defaults write "$sys_domain" AppleDefaultAsciiInputSource -dict \
+    InputSourceKind "Keyboard Layout" \
+    "KeyboardLayout ID" -int "${DEVBOX_KEYBOARD_LAYOUT_ID}" \
+    "KeyboardLayout Name" "${DEVBOX_KEYBOARD_LAYOUT_NAME}"
+  sudo defaults write "$sys_domain" AppleEnabledInputSources -array \
+    "{ InputSourceKind = \"Keyboard Layout\"; \"KeyboardLayout ID\" = ${DEVBOX_KEYBOARD_LAYOUT_ID}; \"KeyboardLayout Name\" = \"${DEVBOX_KEYBOARD_LAYOUT_NAME}\"; }"
+  sudo defaults write "$sys_domain" AppleSelectedInputSources -array \
+    "{ InputSourceKind = \"Keyboard Layout\"; \"KeyboardLayout ID\" = ${DEVBOX_KEYBOARD_LAYOUT_ID}; \"KeyboardLayout Name\" = \"${DEVBOX_KEYBOARD_LAYOUT_NAME}\"; }"
 }
 
 set_timezone() {
@@ -70,8 +83,32 @@ apply_dock_layout() {
     return
   fi
 
-  log "Applying host Dock layout"
-  run_as_target defaults import com.apple.dock "$dock_plist"
+  log "Applying host Dock style"
+
+  # Only inherit Dock appearance settings, not pinned apps (which reference
+  # host-installed apps that may not exist in the guest).
+  local key value
+  for key in tilesize magnification largesize orientation autohide mineffect launchanim show-recents minimize-to-application; do
+    value="$(plutil -extract "$key" raw -o - "$dock_plist" 2>/dev/null || true)"
+    if [[ -n "$value" ]]; then
+      # Detect type: integer vs bool vs string
+      case "$key" in
+        magnification|autohide|launchanim|show-recents|minimize-to-application)
+          if [[ "$value" == "1" ]]; then
+            run_as_target defaults write com.apple.dock "$key" -bool true
+          else
+            run_as_target defaults write com.apple.dock "$key" -bool false
+          fi
+          ;;
+        tilesize|largesize)
+          run_as_target defaults write com.apple.dock "$key" -int "$value"
+          ;;
+        *)
+          run_as_target defaults write com.apple.dock "$key" -string "$value"
+          ;;
+      esac
+    fi
+  done
   run_as_target killall Dock 2>/dev/null || true
 }
 
