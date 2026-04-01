@@ -48,7 +48,9 @@ write_keyboard_defaults() {
   run_as_target defaults write "$domain" AppleSelectedInputSources -array \
     "{ InputSourceKind = \"Keyboard Layout\"; \"KeyboardLayout ID\" = ${DEVBOX_KEYBOARD_LAYOUT_ID}; \"KeyboardLayout Name\" = \"${DEVBOX_KEYBOARD_LAYOUT_NAME}\"; }" \
     '{ "Bundle ID" = "com.apple.PressAndHold"; InputSourceKind = "Non Keyboard Input Method"; }'
-  run_as_target killall cfprefsd >/dev/null 2>&1 || true
+
+  # Also write to the global domain so the login session picks it up.
+  run_as_target defaults write -g AppleCurrentKeyboardLayoutInputSourceID -string "$DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID"
 }
 
 set_timezone() {
@@ -175,6 +177,10 @@ main() {
   apply_key_repeat
   apply_trackpad
   apply_gitconfig
+
+  # Flush preferences cache so the next GUI login picks up all changes.
+  run_as_target killall cfprefsd >/dev/null 2>&1 || true
+
   install_brewfile
   log "Guest bootstrap finished"
 }
