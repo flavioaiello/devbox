@@ -1,0 +1,2 @@
+# Add more packages or casks here to extend the guest bootstrap.
+cask "visual-studio-code"

@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ -f "${PWD}/devbox.env" ]]; then
+  PROJECT_DIR="${PWD}"
+else
+  PROJECT_DIR="${INSTALL_DIR}"
+fi
+
+CONFIG_FILE="${DEVBOX_CONFIG:-${PROJECT_DIR}/devbox.env}"
+LOCAL_CONFIG_FILE="${DEVBOX_LOCAL_CONFIG:-${PROJECT_DIR}/devbox.local.env}"
+STATE_DIR="${PROJECT_DIR}/.devbox"
+HEADLESS_LOG="${STATE_DIR}/headless.log"
+HEADLESS_PID=""
+MOUNT_ARGS=()
+
+log() {
+  printf '[devbox] %s\n' "$*"
+}
+
+warn() {
+  printf '[devbox] warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[devbox] error: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local exit_code
+  exit_code=$?
+
+  if [[ -n "${HEADLESS_PID}" ]] && kill -0 "${HEADLESS_PID}" >/dev/null 2>&1; then
+    tart stop "${TART_VM_NAME}" --timeout 10 >/dev/null 2>&1 || kill "${HEADLESS_PID}" >/dev/null 2>&1 || true
+    wait "${HEADLESS_PID}" >/dev/null 2>&1 || true
+  fi
+
+  exit "${exit_code}"
+}
+
+trap cleanup EXIT INT TERM
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [command] [args...]
+
+Commands:
+  up         Recreate the VM from the latest image, provision it, then open the GUI.
+  refresh    Pull the latest image and recreate the local VM without booting it.
+  provision  Boot the local VM headless, apply guest config, then stop it.
+  run        Run the current local VM with the GUI.
+  stop       Stop the running VM.
+  delete     Stop and delete the local VM.
+  status     Show local VM configuration if it exists.
+  ip         Resolve the current VM IP via the guest agent.
+  shell      Open an interactive login shell in the running VM.
+  exec       Run a non-interactive command in the running VM.
+  open-code  Open the mounted workspace in VS Code inside the guest.
+  logs       Show the last headless provision log.
+  init       Scaffold devbox config files in the current directory.
+  help       Show this help.
+EOF
+}
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+trim_whitespace() {
+  local value
+
+  value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+strip_matching_quotes() {
+  local value
+  local first_char
+  local last_char
+
+  value="$1"
+  if (( ${#value} < 2 )); then
+    printf '%s' "$value"
+    return
+  fi
+
+  first_char="${value:0:1}"
+  last_char="${value: -1}"
+
+  if [[ "$first_char" == "$last_char" ]] && [[ "$first_char" == '"' || "$first_char" == "'" ]]; then
+    printf '%s' "${value:1:${#value}-2}"
+    return
+  fi
+
+  printf '%s' "$value"
+}
+
+expand_home_path() {
+  local path
+
+  path="$1"
+  case "$path" in
+    "~")
+      printf '%s' "$HOME"
+      ;;
+    ~/*)
+      printf '%s/%s' "$HOME" "${path#~/}"
+      ;;
+    *)
+      printf '%s' "$path"
+      ;;
+  esac
+}
+
+resolve_path_from_root() {
+  local path
+
+  path="$(expand_home_path "$1")"
+  if [[ "$path" == /* ]]; then
+    printf '%s' "$path"
+    return
+  fi
+
+  printf '%s/%s' "$PROJECT_DIR" "$path"
+}
+
+load_env_file() {
+  local file_path
+  local line
+  local key
+  local value
+
+  file_path="$1"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim_whitespace "$line")"
+
+    if [[ -z "$line" || "$line" == \#* ]]; then
+      continue
+    fi
+
+    if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      die "invalid config line in ${file_path}: ${line}"
+    fi
+
+    key="${BASH_REMATCH[1]}"
+
+    if [[ ! "$key" =~ ^(TART_|DEVBOX_) ]]; then
+      die "unexpected config key '${key}' in ${file_path}; only TART_* and DEVBOX_* keys are supported"
+    fi
+
+    value="$(trim_whitespace "${BASH_REMATCH[2]}")"
+    value="$(strip_matching_quotes "$value")"
+    printf -v "$key" '%s' "$value"
+  done < "$file_path"
+}
+
+load_config() {
+  [[ -f "${CONFIG_FILE}" ]] || die "missing config file: ${CONFIG_FILE}"
+
+  load_env_file "${CONFIG_FILE}"
+
+  if [[ -f "${LOCAL_CONFIG_FILE}" ]]; then
+    load_env_file "${LOCAL_CONFIG_FILE}"
+  fi
+
+  : "${TART_IMAGE:=ghcr.io/cirruslabs/macos-tahoe-base:latest}"
+  : "${TART_VM_NAME:=devbox}"
+  : "${TART_CPU:=6}"
+  : "${TART_MEMORY_MB:=12288}"
+  : "${TART_DISPLAY:=1728x1117pt}"
+  : "${TART_DISK_GB:=60}"
+  : "${DEVBOX_INHERIT_HOST_DISPLAY:=1}"
+  : "${DEVBOX_SHARE_NAME:=workspace}"
+  : "${DEVBOX_MOUNT_HOME:=0}"
+  : "${DEVBOX_HOME_MOUNT_NAME:=home}"
+  : "${DEVBOX_HOME_MOUNT_PATH:=~}"
+  : "${DEVBOX_HOME_MOUNT_READ_ONLY:=1}"
+  : "${DEVBOX_MOUNT_SSH:=0}"
+  : "${DEVBOX_SSH_MOUNT_NAME:=ssh}"
+  : "${DEVBOX_SSH_MOUNT_PATH:=~/.ssh}"
+  : "${DEVBOX_SSH_MOUNT_READ_ONLY:=1}"
+  : "${DEVBOX_STAGE_DIR:=/Users/admin/.devbox}"
+  : "${DEVBOX_TIMEZONE:=Europe/Zurich}"
+  : "${DEVBOX_INHERIT_HOST_TIMEZONE:=1}"
+  : "${DEVBOX_KEYBOARD_LAYOUT_NAME:=Swiss German}"
+  : "${DEVBOX_KEYBOARD_LAYOUT_ID:=19}"
+  : "${DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID:=com.apple.keylayout.SwissGerman}"
+  : "${DEVBOX_INHERIT_HOST_KEYBOARD:=1}"
+  : "${DEVBOX_INHERIT_HOST_DOCK:=1}"
+  : "${DEVBOX_INHERIT_HOST_APPEARANCE:=1}"
+  : "${DEVBOX_INHERIT_HOST_SCROLL_DIRECTION:=1}"
+  : "${DEVBOX_INHERIT_HOST_KEY_REPEAT:=1}"
+  : "${DEVBOX_INHERIT_HOST_TRACKPAD:=1}"
+  : "${DEVBOX_INHERIT_HOST_GITCONFIG:=1}"
+  : "${DEVBOX_BREWFILE:=guest/Brewfile}"
+  : "${DEVBOX_WAIT_TIMEOUT:=600}"
+  : "${DEVBOX_POLL_INTERVAL:=5}"
+  : "${TART_RUN_EXTRA_ARGS:=}"
+
+  if [[ -z "${DEVBOX_SHARE_PATH:-}" ]]; then
+    DEVBOX_SHARE_PATH="${PROJECT_DIR}"
+  else
+    DEVBOX_SHARE_PATH="$(resolve_path_from_root "${DEVBOX_SHARE_PATH}")"
+  fi
+
+  [[ -d "${DEVBOX_SHARE_PATH}" ]] || die "share path does not exist: ${DEVBOX_SHARE_PATH}"
+
+  DEVBOX_HOME_MOUNT_PATH="$(resolve_path_from_root "${DEVBOX_HOME_MOUNT_PATH}")"
+  DEVBOX_SSH_MOUNT_PATH="$(resolve_path_from_root "${DEVBOX_SSH_MOUNT_PATH}")"
+
+  if is_truthy "${DEVBOX_MOUNT_HOME}"; then
+    [[ -d "${DEVBOX_HOME_MOUNT_PATH}" ]] || die "home mount path does not exist: ${DEVBOX_HOME_MOUNT_PATH}"
+  fi
+
+  if is_truthy "${DEVBOX_MOUNT_SSH}"; then
+    [[ -d "${DEVBOX_SSH_MOUNT_PATH}" ]] || die "SSH mount path does not exist: ${DEVBOX_SSH_MOUNT_PATH}"
+  fi
+
+  DEVBOX_BREWFILE_ABS="$(resolve_path_from_root "${DEVBOX_BREWFILE}")"
+  [[ -f "${DEVBOX_BREWFILE_ABS}" ]] || die "missing guest Brewfile: ${DEVBOX_BREWFILE_ABS}"
+
+  mkdir -p "${STATE_DIR}"
+}
+
+assert_unique_mount_names() {
+  local -a names
+  local first_index
+  local second_index
+
+  names=("${DEVBOX_SHARE_NAME}")
+
+  if is_truthy "${DEVBOX_MOUNT_HOME}"; then
+    names+=("${DEVBOX_HOME_MOUNT_NAME}")
+  fi
+
+  if is_truthy "${DEVBOX_MOUNT_SSH}"; then
+    names+=("${DEVBOX_SSH_MOUNT_NAME}")
+  fi
+
+  for (( first_index=0; first_index<${#names[@]}; first_index++ )); do
+    for (( second_index=first_index+1; second_index<${#names[@]}; second_index++ )); do
+      if [[ "${names[$first_index]}" == "${names[$second_index]}" ]]; then
+        die "mount names must be unique; duplicate name: ${names[$first_index]}"
+      fi
+    done
+  done
+}
+
+append_mount_arg() {
+  local name
+  local path
+  local read_only
+  local mount_spec
+
+  name="$1"
+  path="$2"
+  read_only="$3"
+
+  mount_spec="${name}:${path}"
+  if is_truthy "$read_only"; then
+    mount_spec="${mount_spec}:ro"
+  fi
+
+  MOUNT_ARGS+=("--dir=${mount_spec}")
+}
+
+configure_mount_args() {
+  MOUNT_ARGS=()
+  assert_unique_mount_names
+
+  append_mount_arg "${DEVBOX_SHARE_NAME}" "${DEVBOX_SHARE_PATH}" 0
+
+  if is_truthy "${DEVBOX_MOUNT_HOME}"; then
+    append_mount_arg "${DEVBOX_HOME_MOUNT_NAME}" "${DEVBOX_HOME_MOUNT_PATH}" "${DEVBOX_HOME_MOUNT_READ_ONLY}"
+  fi
+
+  if is_truthy "${DEVBOX_MOUNT_SSH}"; then
+    append_mount_arg "${DEVBOX_SSH_MOUNT_NAME}" "${DEVBOX_SSH_MOUNT_PATH}" "${DEVBOX_SSH_MOUNT_READ_ONLY}"
+  fi
+}
+
+get_host_timezone() {
+  local timezone_link
+  local timezone
+
+  timezone_link="$(readlink /etc/localtime 2>/dev/null || true)"
+  if [[ -z "$timezone_link" ]]; then
+    return 1
+  fi
+
+  timezone="${timezone_link#*/zoneinfo/}"
+  if [[ -z "$timezone" || "$timezone" == "$timezone_link" ]]; then
+    return 1
+  fi
+
+  printf '%s' "$timezone"
+}
+
+get_host_keyboard_layout() {
+  local plist_path
+  local input_source_kind
+  local source_id
+  local layout_name
+  local layout_id
+
+  plist_path="$HOME/Library/Preferences/com.apple.HIToolbox.plist"
+  [[ -f "$plist_path" ]] || return 1
+
+  input_source_kind="$(plutil -extract 'AppleSelectedInputSources.0.InputSourceKind' raw -o - "$plist_path" 2>/dev/null || true)"
+  if [[ "$input_source_kind" != "Keyboard Layout" ]]; then
+    return 1
+  fi
+
+  source_id="$(plutil -extract AppleCurrentKeyboardLayoutInputSourceID raw -o - "$plist_path" 2>/dev/null || true)"
+  layout_name="$(plutil -extract 'AppleSelectedInputSources.0.KeyboardLayout Name' raw -o - "$plist_path" 2>/dev/null || true)"
+  layout_id="$(plutil -extract 'AppleSelectedInputSources.0.KeyboardLayout ID' raw -o - "$plist_path" 2>/dev/null || true)"
+
+  if [[ -z "$source_id" || -z "$layout_name" || -z "$layout_id" ]]; then
+    return 1
+  fi
+
+  printf '%s\t%s\t%s\n' "$source_id" "$layout_name" "$layout_id"
+}
+
+get_host_display() {
+  local profiler_output
+  local gpu_index
+  local display_index
+  local is_main
+  local resolution
+  local width
+  local height
+
+  profiler_output="$(mktemp "${TMPDIR:-/tmp}/devbox-display.XXXXXX")"
+  if ! system_profiler SPDisplaysDataType -json > "$profiler_output"; then
+    rm -f "$profiler_output"
+    return 1
+  fi
+
+  for gpu_index in 0 1 2 3; do
+    for display_index in 0 1 2 3 4 5 6 7; do
+      is_main="$(plutil -extract "SPDisplaysDataType.${gpu_index}.spdisplays_ndrvs.${display_index}.spdisplays_main" raw -o - "$profiler_output" 2>/dev/null || true)"
+      if [[ "$is_main" != "spdisplays_yes" ]]; then
+        continue
+      fi
+
+      resolution="$(plutil -extract "SPDisplaysDataType.${gpu_index}.spdisplays_ndrvs.${display_index}._spdisplays_resolution" raw -o - "$profiler_output" 2>/dev/null || true)"
+      rm -f "$profiler_output"
+
+      if [[ "$resolution" =~ ([0-9]+)[[:space:]]x[[:space:]]([0-9]+) ]]; then
+        width="${BASH_REMATCH[1]}"
+        height="${BASH_REMATCH[2]}"
+        printf '%sx%spt' "$width" "$height"
+        return 0
+      fi
+
+      return 1
+    done
+  done
+
+  rm -f "$profiler_output"
+  return 1
+}
+
+inherit_host_display() {
+  local host_display
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_DISPLAY}"; then
+    return
+  fi
+
+  host_display="$(get_host_display 2>/dev/null || true)"
+  if [[ -z "$host_display" ]]; then
+    warn "failed to detect host display; keeping configured display ${TART_DISPLAY}"
+    return
+  fi
+
+  TART_DISPLAY="$host_display"
+  log "Using host display ${TART_DISPLAY}"
+}
+
+inherit_host_timezone() {
+  local host_timezone
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_TIMEZONE}"; then
+    return
+  fi
+
+  host_timezone="$(get_host_timezone 2>/dev/null || true)"
+  if [[ -z "$host_timezone" ]]; then
+    warn "failed to detect host timezone; keeping configured timezone ${DEVBOX_TIMEZONE}"
+    return
+  fi
+
+  DEVBOX_TIMEZONE="$host_timezone"
+  log "Using host timezone ${DEVBOX_TIMEZONE}"
+}
+
+inherit_host_keyboard() {
+  local host_keyboard
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_KEYBOARD}"; then
+    return
+  fi
+
+  host_keyboard="$(get_host_keyboard_layout 2>/dev/null || true)"
+  if [[ -z "$host_keyboard" ]]; then
+    warn "failed to detect a host keyboard layout; keeping configured layout ${DEVBOX_KEYBOARD_LAYOUT_NAME}"
+    return
+  fi
+
+  IFS=$'\t' read -r DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID DEVBOX_KEYBOARD_LAYOUT_NAME DEVBOX_KEYBOARD_LAYOUT_ID <<< "$host_keyboard"
+  log "Using host keyboard layout ${DEVBOX_KEYBOARD_LAYOUT_NAME} (${DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID})"
+}
+
+inherit_host_dock() {
+  local host_dock_plist
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_DOCK}"; then
+    return
+  fi
+
+  host_dock_plist="${HOME}/Library/Preferences/com.apple.dock.plist"
+  if [[ ! -f "$host_dock_plist" ]]; then
+    warn "host dock plist not found; skipping Dock inheritance"
+    return
+  fi
+
+  DEVBOX_HOST_DOCK_PLIST="$host_dock_plist"
+  log "Will inherit host Dock layout"
+}
+
+inherit_host_appearance() {
+  local style
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_APPEARANCE}"; then
+    return
+  fi
+
+  style="$(defaults read -g AppleInterfaceStyle 2>/dev/null || true)"
+  if [[ "$style" == "Dark" ]]; then
+    DEVBOX_APPEARANCE="dark"
+    log "Using host appearance: dark mode"
+  else
+    DEVBOX_APPEARANCE="light"
+    log "Using host appearance: light mode"
+  fi
+}
+
+inherit_host_scroll_direction() {
+  local value
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_SCROLL_DIRECTION}"; then
+    return
+  fi
+
+  value="$(defaults read -g com.apple.swipescrolldirection 2>/dev/null || true)"
+  if [[ -z "$value" ]]; then
+    return
+  fi
+
+  DEVBOX_SCROLL_NATURAL="$value"
+  if [[ "$value" == "1" ]]; then
+    log "Using host scroll direction: natural"
+  else
+    log "Using host scroll direction: classic"
+  fi
+}
+
+inherit_host_key_repeat() {
+  local key_repeat
+  local initial_key_repeat
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_KEY_REPEAT}"; then
+    return
+  fi
+
+  key_repeat="$(defaults read -g KeyRepeat 2>/dev/null || true)"
+  initial_key_repeat="$(defaults read -g InitialKeyRepeat 2>/dev/null || true)"
+
+  if [[ -z "$key_repeat" || -z "$initial_key_repeat" ]]; then
+    return
+  fi
+
+  DEVBOX_KEY_REPEAT="$key_repeat"
+  DEVBOX_INITIAL_KEY_REPEAT="$initial_key_repeat"
+  log "Using host key repeat: rate=${key_repeat} initial=${initial_key_repeat}"
+}
+
+inherit_host_trackpad() {
+  local clicking
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_TRACKPAD}"; then
+    return
+  fi
+
+  clicking="$(defaults read com.apple.AppleMultitouchTrackpad Clicking 2>/dev/null || true)"
+  if [[ -z "$clicking" ]]; then
+    return
+  fi
+
+  DEVBOX_TRACKPAD_TAP_TO_CLICK="$clicking"
+  if [[ "$clicking" == "1" ]]; then
+    log "Using host trackpad: tap-to-click enabled"
+  else
+    log "Using host trackpad: tap-to-click disabled"
+  fi
+}
+
+inherit_host_gitconfig() {
+  local gitconfig
+
+  if ! is_truthy "${DEVBOX_INHERIT_HOST_GITCONFIG}"; then
+    return
+  fi
+
+  gitconfig="${HOME}/.gitconfig"
+  if [[ ! -f "$gitconfig" ]]; then
+    warn "no ~/.gitconfig found on host; skipping git config inheritance"
+    return
+  fi
+
+  DEVBOX_HOST_GITCONFIG="$gitconfig"
+  log "Will inherit host ~/.gitconfig"
+}
+
+apply_host_settings_for_command() {
+  local command
+
+  command="$1"
+  case "$command" in
+    up)
+      inherit_host_display
+      inherit_host_timezone
+      inherit_host_keyboard
+      inherit_host_dock
+      inherit_host_appearance
+      inherit_host_scroll_direction
+      inherit_host_key_repeat
+      inherit_host_trackpad
+      inherit_host_gitconfig
+      ;;
+    refresh)
+      inherit_host_display
+      ;;
+    provision)
+      inherit_host_timezone
+      inherit_host_keyboard
+      inherit_host_dock
+      inherit_host_appearance
+      inherit_host_scroll_direction
+      inherit_host_key_repeat
+      inherit_host_trackpad
+      inherit_host_gitconfig
+      ;;
+    run)
+      inherit_host_display
+      ;;
+  esac
+}
+
+sync_vm_display() {
+  if [[ -z "${TART_DISPLAY:-}" ]]; then
+    return
+  fi
+
+  log "Syncing VM display to ${TART_DISPLAY}"
+  tart set "${TART_VM_NAME}" --display "${TART_DISPLAY}"
+}
+
+require_supported_host() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "this script only supports macOS hosts"
+  [[ "$(uname -m)" == "arm64" ]] || die "Tart macOS VMs require Apple Silicon"
+}
+
+require_host_brew() {
+  command -v brew >/dev/null 2>&1 || die "Homebrew is required on the host"
+}
+
+ensure_tart() {
+  if command -v tart >/dev/null 2>&1; then
+    return
+  fi
+
+  require_host_brew
+  log "Installing Tart on the host"
+  brew install cirruslabs/cli/tart
+}
+
+require_exec_support() {
+  local host_major
+
+  host_major="$(sw_vers -productVersion | awk -F. '{print $1}')"
+  if (( host_major < 14 )); then
+    die "this workflow uses 'tart exec' for guest provisioning and needs host macOS 14 or newer"
+  fi
+}
+
+vm_exists() {
+  tart list --source local --quiet 2>/dev/null | grep -Fxq "${TART_VM_NAME}"
+}
+
+vm_state() {
+  tart get "${TART_VM_NAME}" --format json 2>/dev/null | plutil -extract State raw -o - -
+}
+
+ensure_vm_exists() {
+  vm_exists || die "local VM '${TART_VM_NAME}' does not exist yet. Run '$(basename "$0") up' or '$(basename "$0") refresh' first"
+}
+
+ensure_vm_can_start_for_provision() {
+  local state
+
+  state="$(vm_state)"
+  case "$state" in
+    Running)
+      die "VM '${TART_VM_NAME}' is already running. Stop it with '$(basename "$0") stop' before provisioning, or use '$(basename "$0") shell' to work in the current session."
+      ;;
+    Suspended)
+      die "VM '${TART_VM_NAME}' is suspended. Stop it before provisioning so Tart can start a fresh headless session."
+      ;;
+  esac
+}
+
+ensure_vm_not_running() {
+  local state
+
+  state="$(vm_state)"
+  if [[ "$state" == "Running" ]]; then
+    die "VM '${TART_VM_NAME}' is already running. Use '$(basename "$0") shell' to connect to it or '$(basename "$0") stop' to stop it first."
+  fi
+}
+
+refresh_vm() {
+  log "Pulling ${TART_IMAGE}"
+  tart pull "${TART_IMAGE}"
+
+  if vm_exists; then
+    log "Removing existing local VM ${TART_VM_NAME}"
+    tart stop "${TART_VM_NAME}" --timeout 10 >/dev/null 2>&1 || true
+    tart delete "${TART_VM_NAME}"
+  fi
+
+  log "Cloning ${TART_VM_NAME}"
+  tart clone "${TART_IMAGE}" "${TART_VM_NAME}"
+
+  log "Applying VM resources"
+  tart set "${TART_VM_NAME}" --cpu "${TART_CPU}" --memory "${TART_MEMORY_MB}" --display "${TART_DISPLAY}"
+
+  if [[ -n "${TART_DISK_GB}" ]]; then
+    tart set "${TART_VM_NAME}" --disk-size "${TART_DISK_GB}"
+  fi
+}
+
+build_extra_run_args() {
+  EXTRA_RUN_ARGS=()
+  if [[ -n "${TART_RUN_EXTRA_ARGS}" ]]; then
+    read -ra EXTRA_RUN_ARGS <<< "${TART_RUN_EXTRA_ARGS}"
+  fi
+}
+
+run_vm_headless() {
+  local -a args
+
+  args=(run --no-graphics)
+  if (( ${#MOUNT_ARGS[@]} > 0 )); then
+    args+=("${MOUNT_ARGS[@]}")
+  fi
+  args+=(${EXTRA_RUN_ARGS[@]+"${EXTRA_RUN_ARGS[@]}"})
+  args+=("${TART_VM_NAME}")
+
+  : > "${HEADLESS_LOG}"
+  log "Starting ${TART_VM_NAME} headless for provisioning"
+  tart "${args[@]}" >"${HEADLESS_LOG}" 2>&1 &
+  HEADLESS_PID=$!
+}
+
+wait_for_guest_agent() {
+  local deadline
+  local now
+
+  deadline=$(( $(date +%s) + DEVBOX_WAIT_TIMEOUT ))
+
+  while true; do
+    if [[ -n "${HEADLESS_PID}" ]] && ! kill -0 "${HEADLESS_PID}" >/dev/null 2>&1; then
+      warn "headless Tart run exited early; last log lines follow"
+      tail -n 50 "${HEADLESS_LOG}" >&2 || true
+      die "VM stopped before guest provisioning was possible"
+    fi
+
+    if tart exec "${TART_VM_NAME}" /usr/bin/true >/dev/null 2>&1; then
+      return
+    fi
+
+    now=$(date +%s)
+    if (( now >= deadline )); then
+      die "guest agent did not become ready within ${DEVBOX_WAIT_TIMEOUT} seconds"
+    fi
+
+    sleep "${DEVBOX_POLL_INTERVAL}"
+  done
+}
+
+stage_guest_files() {
+  log "Staging guest bootstrap files"
+  tart exec "${TART_VM_NAME}" /bin/mkdir -p "${DEVBOX_STAGE_DIR}"
+  tart exec -i "${TART_VM_NAME}" /usr/bin/tee "${DEVBOX_STAGE_DIR}/Brewfile" < "${DEVBOX_BREWFILE_ABS}" >/dev/null
+  tart exec -i "${TART_VM_NAME}" /usr/bin/tee "${DEVBOX_STAGE_DIR}/guest-bootstrap.sh" < "${INSTALL_DIR}/scripts/guest-bootstrap.sh" >/dev/null
+  tart exec "${TART_VM_NAME}" /bin/chmod +x "${DEVBOX_STAGE_DIR}/guest-bootstrap.sh"
+
+  if [[ -n "${DEVBOX_HOST_DOCK_PLIST:-}" ]]; then
+    log "Staging host Dock plist"
+    plutil -convert xml1 -o - "${DEVBOX_HOST_DOCK_PLIST}" | tart exec -i "${TART_VM_NAME}" /usr/bin/tee "${DEVBOX_STAGE_DIR}/com.apple.dock.plist" >/dev/null
+  fi
+
+  if [[ -n "${DEVBOX_HOST_GITCONFIG:-}" ]]; then
+    log "Staging host .gitconfig"
+    tart exec -i "${TART_VM_NAME}" /usr/bin/tee "${DEVBOX_STAGE_DIR}/.gitconfig" < "${DEVBOX_HOST_GITCONFIG}" >/dev/null
+  fi
+}
+
+provision_guest() {
+  require_exec_support
+  ensure_vm_exists
+  ensure_vm_can_start_for_provision
+
+  run_vm_headless
+  wait_for_guest_agent
+  stage_guest_files
+
+  log "Running guest bootstrap"
+  tart exec \
+    "${TART_VM_NAME}" \
+    /usr/bin/env \
+    "DEVBOX_TARGET_USER=admin" \
+    "DEVBOX_TARGET_HOME=/Users/admin" \
+    "DEVBOX_BREWFILE=${DEVBOX_STAGE_DIR}/Brewfile" \
+    "DEVBOX_TIMEZONE=${DEVBOX_TIMEZONE}" \
+    "DEVBOX_KEYBOARD_LAYOUT_NAME=${DEVBOX_KEYBOARD_LAYOUT_NAME}" \
+    "DEVBOX_KEYBOARD_LAYOUT_ID=${DEVBOX_KEYBOARD_LAYOUT_ID}" \
+    "DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID=${DEVBOX_KEYBOARD_LAYOUT_SOURCE_ID}" \
+    "DEVBOX_DOCK_PLIST=${DEVBOX_STAGE_DIR}/com.apple.dock.plist" \
+    "DEVBOX_APPEARANCE=${DEVBOX_APPEARANCE:-}" \
+    "DEVBOX_SCROLL_NATURAL=${DEVBOX_SCROLL_NATURAL:-}" \
+    "DEVBOX_KEY_REPEAT=${DEVBOX_KEY_REPEAT:-}" \
+    "DEVBOX_INITIAL_KEY_REPEAT=${DEVBOX_INITIAL_KEY_REPEAT:-}" \
+    "DEVBOX_TRACKPAD_TAP_TO_CLICK=${DEVBOX_TRACKPAD_TAP_TO_CLICK:-}" \
+    "DEVBOX_GITCONFIG=${DEVBOX_STAGE_DIR}/.gitconfig" \
+    /bin/bash "${DEVBOX_STAGE_DIR}/guest-bootstrap.sh"
+
+  log "Stopping headless VM so the new user defaults are applied on next login"
+  tart stop "${TART_VM_NAME}" --timeout 30 >/dev/null
+  wait "${HEADLESS_PID}" >/dev/null 2>&1 || true
+  HEADLESS_PID=""
+}
+
+run_vm_gui() {
+  local -a args
+
+  ensure_vm_exists
+  ensure_vm_not_running
+  sync_vm_display
+
+  args=(run)
+  if (( ${#MOUNT_ARGS[@]} > 0 )); then
+    args+=("${MOUNT_ARGS[@]}")
+  fi
+  args+=(${EXTRA_RUN_ARGS[@]+"${EXTRA_RUN_ARGS[@]}"})
+  args+=("${TART_VM_NAME}")
+
+  log "Opening ${TART_VM_NAME}"
+  exec tart "${args[@]}"
+}
+
+cmd_up() {
+  refresh_vm
+  provision_guest
+  run_vm_gui
+}
+
+cmd_refresh() {
+  refresh_vm
+}
+
+cmd_provision() {
+  provision_guest
+}
+
+cmd_run() {
+  run_vm_gui
+}
+
+cmd_stop() {
+  ensure_vm_exists
+  tart stop "${TART_VM_NAME}" --timeout 30
+}
+
+cmd_delete() {
+  if ! vm_exists; then
+    log "VM ${TART_VM_NAME} is already absent"
+    return
+  fi
+
+  tart stop "${TART_VM_NAME}" --timeout 10 >/dev/null 2>&1 || true
+  tart delete "${TART_VM_NAME}"
+}
+
+cmd_status() {
+  if ! vm_exists; then
+    log "VM ${TART_VM_NAME} does not exist locally"
+    return
+  fi
+
+  tart get "${TART_VM_NAME}"
+}
+
+cmd_ip() {
+  require_exec_support
+  ensure_vm_exists
+  tart ip --resolver agent --wait 30 "${TART_VM_NAME}"
+}
+
+cmd_shell() {
+  require_exec_support
+  ensure_vm_exists
+
+  if [[ $# -eq 0 ]]; then
+    set -- /bin/zsh -l
+  fi
+
+  tart exec -i -t "${TART_VM_NAME}" "$@"
+}
+
+cmd_exec() {
+  require_exec_support
+  ensure_vm_exists
+
+  if [[ $# -eq 0 ]]; then
+    die "exec requires a command. Use '$(basename "$0") shell' for an interactive session."
+  fi
+
+  tart exec "${TART_VM_NAME}" "$@"
+}
+
+cmd_open_code() {
+  require_exec_support
+  ensure_vm_exists
+  tart exec "${TART_VM_NAME}" /usr/bin/open -a "Visual Studio Code" "/Volumes/My Shared Files/${DEVBOX_SHARE_NAME}"
+}
+
+cmd_logs() {
+  [[ -f "${HEADLESS_LOG}" ]] || die "no log file found at ${HEADLESS_LOG}"
+  cat "${HEADLESS_LOG}"
+}
+
+cmd_init() {
+  if [[ -f "devbox.env" ]]; then
+    die "devbox.env already exists in the current directory"
+  fi
+
+  cp "${INSTALL_DIR}/devbox.env" ./devbox.env
+  mkdir -p guest
+  cp "${INSTALL_DIR}/guest/Brewfile" ./guest/Brewfile
+
+  if [[ ! -f ".gitignore" ]]; then
+    if [[ -f "${INSTALL_DIR}/.gitignore" ]]; then
+      cp "${INSTALL_DIR}/.gitignore" ./.gitignore
+    elif [[ -f "${INSTALL_DIR}/gitignore" ]]; then
+      cp "${INSTALL_DIR}/gitignore" ./.gitignore
+    fi
+  fi
+
+  log "Initialized devbox project in ${PWD}"
+  log "Edit devbox.env and guest/Brewfile to customize your dev box"
+}
+
+main() {
+  local command
+
+  command="${1:-up}"
+  shift || true
+
+  case "${command}" in
+    help|-h|--help)
+      usage
+      return
+      ;;
+    init)
+      require_supported_host
+      cmd_init
+      return
+      ;;
+  esac
+
+  require_supported_host
+  load_config
+  apply_host_settings_for_command "${command}"
+  configure_mount_args
+  build_extra_run_args
+  ensure_tart
+
+  case "${command}" in
+    up)
+      cmd_up "$@"
+      ;;
+    refresh)
+      cmd_refresh "$@"
+      ;;
+    provision)
+      cmd_provision "$@"
+      ;;
+    run)
+      cmd_run "$@"
+      ;;
+    stop)
+      cmd_stop "$@"
+      ;;
+    delete)
+      cmd_delete "$@"
+      ;;
+    status)
+      cmd_status "$@"
+      ;;
+    ip)
+      cmd_ip "$@"
+      ;;
+    shell)
+      cmd_shell "$@"
+      ;;
+    exec)
+      cmd_exec "$@"
+      ;;
+    open-code)
+      cmd_open_code "$@"
+      ;;
+    logs)
+      cmd_logs "$@"
+      ;;
+    *)
+      usage >&2
+      die "unknown command: ${command}"
+      ;;
+  esac
+}
+
+main "$@"
