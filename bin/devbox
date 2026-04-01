@@ -3,11 +3,20 @@
 set -euo pipefail
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-if [[ -L "$SCRIPT_PATH" ]]; then
+while [[ -L "$SCRIPT_PATH" ]]; do
+  LINK_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
   SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
-fi
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="${LINK_DIR}/${SCRIPT_PATH}"
+done
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# When installed via Homebrew, assets live next to the script in libexec.
+# When running from source, assets live in the parent directory.
+if [[ -f "${SCRIPT_DIR}/devbox.env" ]]; then
+  INSTALL_DIR="${SCRIPT_DIR}"
+else
+  INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 
 if [[ -f "${PWD}/devbox.env" ]]; then
   PROJECT_DIR="${PWD}"
