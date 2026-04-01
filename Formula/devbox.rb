@@ -2,7 +2,7 @@ class Devbox < Formula
   desc "Immutable local macOS dev box workflow using Tart VMs"
   homepage "https://github.com/flavioaiello/devbox"
   url "https://github.com/flavioaiello/devbox/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "7ebdbe4c308fa5ae93736dec45c245b3dc3ee167caa0975e8e0452a8e33bf2e5"
   license "MIT"
 
   depends_on :macos
@@ -15,7 +15,7 @@ class Devbox < Formula
     libexec.install "devbox.env"
     libexec.install ".gitignore" => "gitignore"
 
-    (bin/"devbox").write_env_script libexec/"devbox", {}
+    bin.install_symlink libexec/"devbox"
   end
 
   def caveats
