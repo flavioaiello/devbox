@@ -6,8 +6,8 @@ class Devbox < Formula
   license "MIT"
   head "https://github.com/flavioaiello/devbox.git", branch: "main"
 
+  depends_on arch: :arm64
   depends_on :macos
-  depends_on :arch => :arm64
 
   def install
     libexec.install "bin/devbox" => "devbox"
