@@ -62,11 +62,13 @@ step_bundle() {
 # Runs before and after `bundle`: the first pass makes a resumed build safe (apps from an earlier run).
 step_trust() {
   [[ ${INSTALL_BREWFILE:-1} == 1 && ${TRUST_BREWFILE_APPS:-1} == 1 ]] || return 0
-  step "First-launch confirmation for Brewfile apps"
+  step "First-launch confirmation for Brewfile apps and tools"
   eval "$($BREW shellenv)"
   # Homebrew verified the cask downloads (pinned sha256). Without this, Gatekeeper asks "downloaded from
   # the Internet — open?" on the first launch of every app, and `code` from a script blocks on that dialog.
-  local cask app
+  # Command-line casks (codex, ...) keep their binaries in the Caskroom and wait on the same dialog.
+  local cask app caskroom
+  caskroom="$(brew --caskroom)"
   command -v jq >/dev/null 2>&1 || brew install jq
   for cask in $(brew list --cask 2>/dev/null); do
     for app in $(brew info --cask --json=v2 "$cask" | jq -r '.casks[0].artifacts[] | select(type == "object") | .app? // empty | .[] | select(type == "string") | gsub(" "; "@")'); do
@@ -76,6 +78,10 @@ step_trust() {
         echo "  trusted: $app"
       fi
     done
+    if [[ -d "$caskroom/$cask" ]]; then
+      xattr -dr com.apple.quarantine "$caskroom/$cask" 2>/dev/null || true
+      echo "  trusted: $cask (Caskroom)"
+    fi
   done
 }
 

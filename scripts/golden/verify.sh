@@ -95,6 +95,15 @@ main_checks() {
       # canary: with Gatekeeper on, an untrusted app would hang here on a dialog (perl: poor man's timeout)
       if perl -e 'alarm 45; exec @ARGV' code --list-extensions >/dev/null 2>&1; then ok "VS Code starts without a Gatekeeper dialog"; else bad "VS Code did not start unattended (Gatekeeper dialog?)"; fi
     fi
+    if [[ ${TRUST_BREWFILE_APPS:-1} == 1 ]]; then
+      # Command-line casks (codex, ...) are linked into /opt/homebrew/bin. One that still carries the quarantine
+      # flag waits for a Gatekeeper dialog (exit status 142: the perl timeout fired).
+      for link in /opt/homebrew/bin/*; do
+        [[ -L $link && $(readlink "$link") == *"/Caskroom/"* ]] || continue
+        perl -e 'alarm 60; exec @ARGV' "$link" --version </dev/null >/dev/null 2>&1
+        if (($? == 142)); then bad "${link##*/} did not start unattended (Gatekeeper dialog?)"; else ok "${link##*/} starts without a Gatekeeper dialog"; fi
+      done
+    fi
     for ext in $(sed -n 's/^vscode "\([^"]*\)".*/\1/p' Brewfile); do
       lower=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
       if compgen -G "$HOME/.vscode/extensions/$lower-*" >/dev/null; then ok "VS Code extension $ext"; else bad "VS Code extension $ext missing"; fi

@@ -21,6 +21,7 @@ cask "visual-studio-code"
 cask "microsoft-edge"
 cask "git-credential-manager"
 cask "azure-cli"       # moved from homebrew/core to casks
+cask "codex"           # OpenAI Codex CLI (distributed as a cask, there is no formula)
 
 # --- VS Code extensions ------------------------------------------------------------------------
 vscode "tomoki1207.pdf"

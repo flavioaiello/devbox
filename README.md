@@ -128,7 +128,7 @@ TART_RUN_EXTRA_ARGS="--net-bridged=en0"
 DEVBOX_GOLDEN_IMAGE="ghcr.io/cirruslabs/macos-tahoe-vanilla:latest"
 DEVBOX_DOCK_APPS="/Applications/Microsoft Edge.app|/Applications/Visual Studio Code.app"
 DEVBOX_ENABLE_GATEKEEPER="1"      # the vanilla image ships with it off
-DEVBOX_TRUST_BREWFILE_APPS="1"    # no first-launch dialog for Brewfile apps
+DEVBOX_TRUST_BREWFILE_APPS="1"    # no first-launch dialog for Brewfile apps and tools
 ```
 
 ## How It Works
