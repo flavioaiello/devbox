@@ -1,2 +1,33 @@
-# Add more packages or casks here to extend the guest bootstrap.
+# Default programs for the guest. In golden mode they are installed once while the image is built
+# (`devbox build`); in ephemeral mode on every `devbox up`. Edit the list, then rebuild.
+#
+# Only homebrew/core and homebrew/cask are used on purpose: recent Homebrew versions ask for an
+# explicit `brew trust` for every third-party tap.
+
+# --- Command line ------------------------------------------------------------------------------
+brew "git"
+brew "gh"              # GitHub CLI
+brew "jq"
+brew "wget"
+brew "tree"
+brew "ripgrep"
+brew "htop"
+brew "node"
+brew "uv"              # Python toolchain manager
+brew "python@3.13"
+
+# --- Apps --------------------------------------------------------------------------------------
 cask "visual-studio-code"
+cask "microsoft-edge"
+cask "git-credential-manager"
+cask "azure-cli"       # moved from homebrew/core to casks
+
+# --- VS Code extensions ------------------------------------------------------------------------
+vscode "tomoki1207.pdf"
+
+# --- Optional (uncomment, then rebuild) --------------------------------------------------------
+# cask "powershell"
+# cask "iterm2"
+# cask "microsoft-teams"
+# cask "microsoft-office"      # several GB
+# brew "kubernetes-cli"

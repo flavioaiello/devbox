@@ -30,6 +30,7 @@ STATE_DIR="${PROJECT_DIR}/.devbox"
 HEADLESS_LOG="${STATE_DIR}/headless.log"
 HEADLESS_PID=""
 MOUNT_ARGS=()
+DEVBOX_VERSION="0.2.0"
 
 log() {
   printf '[devbox] %s\n' "$*"
@@ -48,6 +49,10 @@ cleanup() {
   local exit_code
   exit_code=$?
 
+  if declare -F golden_cleanup >/dev/null 2>&1; then
+    golden_cleanup "${exit_code}"
+  fi
+
   if [[ -n "${HEADLESS_PID}" ]] && kill -0 "${HEADLESS_PID}" >/dev/null 2>&1; then
     tart stop "${TART_VM_NAME}" --timeout 10 >/dev/null 2>&1 || kill "${HEADLESS_PID}" >/dev/null 2>&1 || true
     wait "${HEADLESS_PID}" >/dev/null 2>&1 || true
@@ -58,24 +63,38 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+# Golden image mode: build a configured image once, clone it for day-to-day use.
+# shellcheck source=../scripts/golden.sh
+source "${INSTALL_DIR}/scripts/golden.sh"
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [command] [args...]
 
+Two modes (DEVBOX_MODE in devbox.env):
+  golden      Build a configured image once (build), then clone it (up). Updating means rebuilding.
+  ephemeral   Recreate the VM from the latest image and provision it on every up.
+
 Commands:
-  up         Recreate the VM from the latest image, provision it, then open the GUI.
-  refresh    Pull the latest image and recreate the local VM without booting it.
-  provision  Boot the local VM headless, apply guest config, then stop it.
+  up         Golden: clone the golden image on first use and open it (--fresh re-clones, --rebuild
+             rebuilds the image first, -y skips the confirmation). Ephemeral: recreate the VM from the
+             latest image, provision it, then open the GUI.
+  build      Golden: build or refresh the golden image (--resume retries a failed build).
+  capture    Golden: snapshot this Mac's settings (keyboard, region, trackpad, Dock, ...) for the image.
+  refresh    Ephemeral: pull the latest image and recreate the local VM without booting it.
+  provision  Ephemeral: boot the local VM headless, apply guest config, then stop it.
   run        Run the current local VM with the GUI.
   stop       Stop the running VM.
   delete     Stop and delete the local VM.
-  status     Show local VM configuration if it exists.
+  status     Show local VM configuration (and the last golden build).
   ip         Resolve the current VM IP via the guest agent.
   shell      Open an interactive login shell in the running VM.
   exec       Run a non-interactive command in the running VM.
   open-code  Open the mounted workspace in VS Code inside the guest.
   logs       Show the last headless provision log.
+  install    Install or update Tart from the official release (checksum verified).
   init       Scaffold devbox config files in the current directory.
+  version    Show the devbox version.
   help       Show this help.
 EOF
 }
@@ -224,6 +243,21 @@ load_config() {
   : "${DEVBOX_WAIT_TIMEOUT:=600}"
   : "${DEVBOX_POLL_INTERVAL:=5}"
   : "${TART_RUN_EXTRA_ARGS:=}"
+  : "${DEVBOX_MODE:=ephemeral}"
+  : "${DEVBOX_GOLDEN_IMAGE:=ghcr.io/cirruslabs/macos-tahoe-vanilla:latest}"
+  : "${DEVBOX_GOLDEN_NAME:=devbox-golden}"
+  : "${DEVBOX_DISPLAY_REFIT:=1}"
+  : "${DEVBOX_INSTALL_ROSETTA:=1}"
+  : "${DEVBOX_ENABLE_GATEKEEPER:=1}"
+  : "${DEVBOX_TRUST_BREWFILE_APPS:=1}"
+  : "${DEVBOX_DOCK_APPS:=/Applications/Microsoft Edge.app|/Applications/Visual Studio Code.app|/System/Applications/Utilities/Terminal.app|/System/Applications/System Settings.app}"
+  : "${DEVBOX_INHERIT_HOST_REGION:=1}"
+  : "${DEVBOX_INHERIT_HOST_UI:=1}"
+
+  case "${DEVBOX_MODE}" in
+    golden|ephemeral) ;;
+    *) die "DEVBOX_MODE must be 'golden' or 'ephemeral' (got '${DEVBOX_MODE}')" ;;
+  esac
 
   if [[ -z "${DEVBOX_SHARE_PATH:-}" ]]; then
     DEVBOX_SHARE_PATH="${PROJECT_DIR}"
@@ -556,6 +590,25 @@ apply_host_settings_for_command() {
   local command
 
   command="$1"
+
+  # Golden mode snapshots the rest of the host settings into the image (devbox capture).
+  case "$command" in
+    build|capture)
+      inherit_host_display
+      inherit_host_timezone
+      return
+      ;;
+  esac
+  if golden_mode; then
+    case "$command" in
+      up|run)
+        inherit_host_display
+        inherit_host_timezone
+        ;;
+    esac
+    return
+  fi
+
   case "$command" in
     up)
       inherit_host_display
@@ -610,9 +663,9 @@ ensure_tart() {
     return
   fi
 
-  require_host_brew
-  log "Installing Tart on the host"
-  brew install cirruslabs/cli/tart
+  log "Tart is not installed; installing it from the official release"
+  cmd_install
+  command -v tart >/dev/null 2>&1 || die "Tart was installed but is not on PATH; add ${GOLDEN_TART_BINDIR:-\$HOME/.local/bin} to your PATH"
 }
 
 require_exec_support() {
@@ -801,16 +854,23 @@ run_vm_gui() {
 }
 
 cmd_up() {
+  if golden_mode; then
+    golden_up "$@"
+    return
+  fi
+
   refresh_vm
   provision_guest
   run_vm_gui
 }
 
 cmd_refresh() {
+  golden_require_ephemeral refresh
   refresh_vm
 }
 
 cmd_provision() {
+  golden_require_ephemeral provision
   provision_guest
 }
 
@@ -834,12 +894,15 @@ cmd_delete() {
 }
 
 cmd_status() {
-  if ! vm_exists; then
+  if vm_exists; then
+    tart get "${TART_VM_NAME}"
+  else
     log "VM ${TART_VM_NAME} does not exist locally"
-    return
   fi
 
-  tart get "${TART_VM_NAME}"
+  if golden_mode; then
+    golden_status
+  fi
 }
 
 cmd_ip() {
@@ -913,9 +976,18 @@ main() {
       usage
       return
       ;;
+    version|-v|--version)
+      printf 'devbox %s\n' "${DEVBOX_VERSION}"
+      return
+      ;;
     init)
       require_supported_host
       cmd_init
+      return
+      ;;
+    install)
+      require_supported_host
+      cmd_install "$@"
       return
       ;;
   esac
@@ -925,11 +997,19 @@ main() {
   apply_host_settings_for_command "${command}"
   configure_mount_args
   build_extra_run_args
-  ensure_tart
+  if [[ "${command}" != "capture" ]]; then
+    ensure_tart
+  fi
 
   case "${command}" in
     up)
       cmd_up "$@"
+      ;;
+    build)
+      golden_build "$@"
+      ;;
+    capture)
+      cmd_capture "$@"
       ;;
     refresh)
       cmd_refresh "$@"

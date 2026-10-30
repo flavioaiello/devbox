@@ -4,6 +4,7 @@ class Devbox < Formula
   url "https://github.com/flavioaiello/devbox/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "f2b25afda9ad9295d49115084e94080fc98c7b7a476b182bd7f270781657028f"
   license "MIT"
+  head "https://github.com/flavioaiello/devbox.git", branch: "main"
 
   depends_on :macos
   depends_on :arch => :arm64
@@ -26,11 +27,14 @@ class Devbox < Formula
         devbox init
         devbox up
 
-      Edit devbox.env and guest/Brewfile to customize your dev box.
+      The first `devbox up` builds a configured macOS image (about 10 minutes, once), after that the VM
+      starts in seconds. Edit devbox.env and guest/Brewfile to customize your dev box.
+      DEVBOX_MODE="ephemeral" recreates and provisions the VM on every `devbox up` instead.
     EOS
   end
 
   test do
     assert_match "Usage:", shell_output("#{bin}/devbox help")
+    assert_match "devbox", shell_output("#{bin}/devbox version")
   end
 end
